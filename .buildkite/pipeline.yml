@@ -1,0 +1,549 @@
+# Buildkite Pipeline for OpenTofu with Security Scanning and Multi-Environment Deployment (Windows)
+steps:
+  # ====================
+  # BUILD PHASE
+  # ====================
+  
+  - label: ":hammer: Code Formatting Check"
+    key: "format-check"
+    command: |
+      Write-Host "--- Checking OpenTofu formatting"
+      tofu fmt -check -recursive
+      
+      Write-Host "--- Checking for trailing whitespace and other formatting issues"
+      # Check for trailing whitespace in .tf files
+      $files = Get-ChildItem -Recurse -Filter "*.tf" | Where-Object { (Get-Content $_.FullName -Raw) -match '\s+
+    
+  - label: ":shield: Security Scanning"
+    key: "security-scan"
+    depends_on: "format-check"
+    command: |
+      Write-Host "--- Running security scanning tools"
+      # Run your PowerShell security scanning script
+      .\scripts\security-scan.ps1
+      
+      Write-Host "--- Uploading security scan results"
+      buildkite-agent artifact upload "security-reports\**\*"
+    artifact_paths:
+      - "security-reports\\**\\*"
+    agents:
+      queue: "windows"
+    
+  - label: ":mag: OpenTofu Validation"
+    key: "tofu-validate"
+    depends_on: "format-check"
+    command: |
+      Write-Host "--- Authenticating to Vault"
+      $env:VAULT_ADDR = $env:VAULT_ADDR
+      vault auth -method=jwt role=buildkite-terraform jwt=$env:BUILDKITE_OIDC_TOKEN
+      
+      Write-Host "--- Retrieving MinIO credentials from Vault"
+      $env:AWS_ACCESS_KEY_ID = vault kv get -field=access_key secret/minio/terraform
+      $env:AWS_SECRET_ACCESS_KEY = vault kv get -field=secret_key secret/minio/terraform
+      
+      Write-Host "--- Initializing OpenTofu"
+      tofu init
+      
+      Write-Host "--- Validating OpenTofu configuration"
+      tofu validate
+      
+      Write-Host "--- Running OpenTofu plan (validation)"
+      tofu plan -out=tfplan
+      
+      Write-Host "--- Uploading plan file"
+      buildkite-agent artifact upload "tfplan"
+    artifact_paths:
+      - "tfplan"
+    env:
+      VAULT_ADDR: "https://your-vault.example.com"
+    plugins:
+      - hashicorp/vault#v1.3.0:
+          server: https://your-vault.example.com
+          auth:
+            method: jwt
+            role: buildkite-terraform
+    agents:
+      queue: "windows"
+
+  # Wait for all build phase steps to complete
+  - wait: ~
+    continue_on_failure: false
+
+  # ====================
+  # DEPLOYMENT GATE
+  # ====================
+  
+  - block: ":rocket: Deploy to Development?"
+    prompt: "Ready to deploy to development environment?"
+    fields:
+      - select: "confirmation"
+        key: "deploy_confirmation"
+        options:
+          - label: "Yes, deploy to development"
+            value: "yes"
+          - label: "No, cancel deployment"
+            value: "no"
+        default: "no"
+        required: true
+
+  # ====================
+  # DEVELOPMENT DEPLOYMENT
+  # ====================
+  
+  - label: ":seedling: Deploy to Development"
+    key: "deploy-dev"
+    command: |
+      Write-Host "--- Authenticating to Vault"
+      $env:VAULT_ADDR = $env:VAULT_ADDR
+      vault auth -method=jwt role=buildkite-terraform jwt=$env:BUILDKITE_OIDC_TOKEN
+      
+      Write-Host "--- Retrieving MinIO credentials from Vault"
+      $env:AWS_ACCESS_KEY_ID = vault kv get -field=access_key secret/minio/terraform
+      $env:AWS_SECRET_ACCESS_KEY = vault kv get -field=secret_key secret/minio/terraform
+      
+      Write-Host "--- Retrieving development environment secrets"
+      $env:TF_VAR_db_password = vault kv get -field=db_password secret/terraform/dev
+      $env:TF_VAR_api_key = vault kv get -field=api_key secret/terraform/dev
+      # Add other dev-specific secrets as needed
+      
+      Write-Host "--- Downloading plan file"
+      buildkite-agent artifact download "tfplan" .
+      
+      Write-Host "--- Initializing OpenTofu for development"
+      tofu init
+      
+      Write-Host "--- Applying OpenTofu plan to development"
+      tofu apply -auto-approve tfplan
+      
+      Write-Host "--- Generating development outputs"
+      tofu output -json | Out-File -FilePath "dev-outputs.json" -Encoding utf8
+      buildkite-agent artifact upload "dev-outputs.json"
+    artifact_paths:
+      - "dev-outputs.json"
+    env:
+      VAULT_ADDR: "https://your-vault.example.com"
+      TF_WORKSPACE: "development"
+    plugins:
+      - hashicorp/vault#v1.3.0:
+          server: https://your-vault.example.com
+          auth:
+            method: jwt
+            role: buildkite-terraform
+    agents:
+      queue: "windows"
+    if: build.env("deploy_confirmation") == "yes"
+
+  # ====================
+  # STAGING DEPLOYMENT
+  # ====================
+  
+  - block: ":test_tube: Deploy to Staging?"
+    prompt: "Deploy to staging environment?"
+    depends_on: "deploy-dev"
+    fields:
+      - select: "staging_confirmation"
+        key: "deploy_staging"
+        options:
+          - label: "Yes, deploy to staging"
+            value: "yes"
+          - label: "No, skip staging"
+            value: "no"
+        default: "no"
+        required: true
+
+  - label: ":test_tube: Deploy to Staging"
+    key: "deploy-staging"
+    depends_on: "deploy-dev"
+    command: |
+      Write-Host "--- Authenticating to Vault"
+      $env:VAULT_ADDR = $env:VAULT_ADDR
+      vault auth -method=jwt role=buildkite-terraform jwt=$env:BUILDKITE_OIDC_TOKEN
+      
+      Write-Host "--- Retrieving MinIO credentials from Vault"
+      $env:AWS_ACCESS_KEY_ID = vault kv get -field=access_key secret/minio/terraform
+      $env:AWS_SECRET_ACCESS_KEY = vault kv get -field=secret_key secret/minio/terraform
+      
+      Write-Host "--- Retrieving staging environment secrets"
+      $env:TF_VAR_db_password = vault kv get -field=db_password secret/terraform/staging
+      $env:TF_VAR_api_key = vault kv get -field=api_key secret/terraform/staging
+      # Add other staging-specific secrets as needed
+      
+      Write-Host "--- Initializing OpenTofu for staging"
+      tofu init
+      
+      Write-Host "--- Planning OpenTofu for staging"
+      tofu plan -out=staging-tfplan
+      
+      Write-Host "--- Applying OpenTofu plan to staging"
+      tofu apply -auto-approve staging-tfplan
+      
+      Write-Host "--- Generating staging outputs"
+      tofu output -json | Out-File -FilePath "staging-outputs.json" -Encoding utf8
+      buildkite-agent artifact upload "staging-outputs.json"
+    artifact_paths:
+      - "staging-outputs.json"
+      - "staging-tfplan"
+    env:
+      VAULT_ADDR: "https://your-vault.example.com"
+      TF_WORKSPACE: "staging"
+    plugins:
+      - hashicorp/vault#v1.3.0:
+          server: https://your-vault.example.com
+          auth:
+            method: jwt
+            role: buildkite-terraform
+    agents:
+      queue: "windows"
+    if: build.env("deploy_staging") == "yes"
+
+  # ====================
+  # PRODUCTION DEPLOYMENT
+  # ====================
+  
+  - block: ":rocket: Deploy to Production?"
+    prompt: "Deploy to production environment? This requires additional approval."
+    depends_on: "deploy-staging"
+    fields:
+      - select: "production_confirmation"
+        key: "deploy_production"
+        options:
+          - label: "Yes, deploy to production"
+            value: "yes"
+          - label: "No, cancel production deployment"
+            value: "no"
+        default: "no"
+        required: true
+      - text: "deployment_reason"
+        key: "reason"
+        hint: "Please provide a reason for this production deployment"
+        required: true
+
+  - label: ":warning: Production Pre-deployment Check"
+    key: "prod-pre-check"
+    depends_on: "deploy-staging"
+    command: |
+      Write-Host "--- Authenticating to Vault"
+      $env:VAULT_ADDR = $env:VAULT_ADDR
+      vault auth -method=jwt role=buildkite-terraform jwt=$env:BUILDKITE_OIDC_TOKEN
+      
+      Write-Host "--- Retrieving MinIO credentials from Vault"
+      $env:AWS_ACCESS_KEY_ID = vault kv get -field=access_key secret/minio/terraform
+      $env:AWS_SECRET_ACCESS_KEY = vault kv get -field=secret_key secret/minio/terraform
+      
+      Write-Host "--- Retrieving production environment secrets"
+      $env:TF_VAR_db_password = vault kv get -field=db_password secret/terraform/production
+      $env:TF_VAR_api_key = vault kv get -field=api_key secret/terraform/production
+      
+      Write-Host "--- Initializing OpenTofu for production"
+      tofu init
+      
+      Write-Host "--- Running production plan (dry run)"
+      tofu plan -out=production-tfplan
+      
+      Write-Host "--- Production plan review"
+      Write-Host "Deployment reason: $env:reason"
+      
+      buildkite-agent artifact upload "production-tfplan"
+    artifact_paths:
+      - "production-tfplan"
+    env:
+      VAULT_ADDR: "https://your-vault.example.com"
+      TF_WORKSPACE: "production"
+    plugins:
+      - hashicorp/vault#v1.3.0:
+          server: https://your-vault.example.com
+          auth:
+            method: jwt
+            role: buildkite-terraform
+    agents:
+      queue: "windows"
+    if: build.env("deploy_production") == "yes"
+
+  - label: ":rocket: Deploy to Production"
+    key: "deploy-production"
+    depends_on: "prod-pre-check"
+    command: |
+      Write-Host "--- Authenticating to Vault"
+      $env:VAULT_ADDR = $env:VAULT_ADDR
+      vault auth -method=jwt role=buildkite-terraform jwt=$env:BUILDKITE_OIDC_TOKEN
+      
+      Write-Host "--- Retrieving MinIO credentials from Vault"
+      $env:AWS_ACCESS_KEY_ID = vault kv get -field=access_key secret/minio/terraform
+      $env:AWS_SECRET_ACCESS_KEY = vault kv get -field=secret_key secret/minio/terraform
+      
+      Write-Host "--- Retrieving production environment secrets"
+      $env:TF_VAR_db_password = vault kv get -field=db_password secret/terraform/production
+      $env:TF_VAR_api_key = vault kv get -field=api_key secret/terraform/production
+      
+      Write-Host "--- Downloading production plan"
+      buildkite-agent artifact download "production-tfplan" .
+      
+      Write-Host "--- Initializing OpenTofu for production"
+      tofu init
+      
+      Write-Host "--- Applying OpenTofu plan to production"
+      tofu apply -auto-approve production-tfplan
+      
+      Write-Host "--- Generating production outputs"
+      tofu output -json | Out-File -FilePath "production-outputs.json" -Encoding utf8
+      buildkite-agent artifact upload "production-outputs.json"
+      
+      Write-Host "--- Production deployment completed successfully"
+      Write-Host "Deployment reason: $env:reason"
+    artifact_paths:
+      - "production-outputs.json"
+    env:
+      VAULT_ADDR: "https://your-vault.example.com"
+      TF_WORKSPACE: "production"
+    plugins:
+      - hashicorp/vault#v1.3.0:
+          server: https://your-vault.example.com
+          auth:
+            method: jwt
+            role: buildkite-terraform
+    agents:
+      queue: "windows"
+    if: build.env("deploy_production") == "yes" }
+      if ($files) {
+        Write-Host "Trailing whitespace found in the following files:"
+        $files | ForEach-Object { Write-Host $_.FullName }
+        exit 1
+      }
+    agents:
+      queue: "windows"
+    
+  - label: ":shield: Security Scanning"
+    key: "security-scan"
+    depends_on: "format-check"
+    command: |
+      echo "--- Running security scanning tools"
+      # Run your PowerShell security scanning script
+      pwsh -File ./scripts/security-scan.ps1
+      
+      echo "--- Uploading security scan results"
+      buildkite-agent artifact upload "security-reports/**/*"
+    artifact_paths:
+      - "security-reports/**/*"
+    agents:
+      queue: "default"
+    
+  - label: ":mag: OpenTofu Validation"
+    key: "tofu-validate"
+    depends_on: "format-check"
+    command: |
+      echo "--- Authenticating to Vault"
+      export VAULT_ADDR="${VAULT_ADDR}"
+      vault auth -method=jwt role=buildkite-terraform jwt=$$BUILDKITE_OIDC_TOKEN
+      
+      echo "--- Retrieving MinIO credentials from Vault"
+      export AWS_ACCESS_KEY_ID=$$(vault kv get -field=access_key secret/minio/terraform)
+      export AWS_SECRET_ACCESS_KEY=$$(vault kv get -field=secret_key secret/minio/terraform)
+      
+      echo "--- Initializing OpenTofu"
+      tofu init
+      
+      echo "--- Validating OpenTofu configuration"
+      tofu validate
+      
+      echo "--- Running OpenTofu plan (validation)"
+      tofu plan -out=tfplan
+      
+      echo "--- Uploading plan file"
+      buildkite-agent artifact upload "tfplan"
+    artifact_paths:
+      - "tfplan"
+    env:
+      VAULT_ADDR: "https://your-vault.example.com"
+    plugins:
+      - hashicorp/vault#v1.3.0:
+          server: https://your-vault.example.com
+          auth:
+            method: jwt
+            role: buildkite-terraform
+    agents:
+      queue: "default"
+
+  # Wait for all build phase steps to complete
+  - wait: ~
+    continue_on_failure: false
+
+  # ====================
+  # DEPLOYMENT GATE
+  # ====================
+  
+  - block: ":rocket: Deploy to Development?"
+    prompt: "Ready to deploy to development environment?"
+    fields:
+      - select: "confirmation"
+        key: "deploy_confirmation"
+        options:
+          - label: "Yes, deploy to development"
+            value: "yes"
+          - label: "No, cancel deployment"
+            value: "no"
+        default: "no"
+        required: true
+
+  # ====================
+  # DEVELOPMENT DEPLOYMENT
+  # ====================
+  
+  - label: ":seedling: Deploy to Development"
+    key: "deploy-dev"
+    command: |
+      echo "--- Authenticating to Vault"
+      export VAULT_ADDR="${VAULT_ADDR}"
+      vault auth -method=jwt role=buildkite-terraform jwt=$$BUILDKITE_OIDC_TOKEN
+      
+      echo "--- Retrieving MinIO credentials from Vault"
+      export AWS_ACCESS_KEY_ID=$$(vault kv get -field=access_key secret/minio/terraform)
+      export AWS_SECRET_ACCESS_KEY=$$(vault kv get -field=secret_key secret/minio/terraform)
+      
+      echo "--- Retrieving development environment secrets"
+      export TF_VAR_db_password=$$(vault kv get -field=db_password secret/terraform/dev)
+      export TF_VAR_api_key=$$(vault kv get -field=api_key secret/terraform/dev)
+      # Add other dev-specific secrets as needed
+      
+      echo "--- Downloading plan file"
+      buildkite-agent artifact download "tfplan" .
+      
+      echo "--- Initializing OpenTofu for development"
+      tofu init
+      
+      echo "--- Applying OpenTofu plan to development"
+      tofu apply -auto-approve tfplan
+      
+      echo "--- Generating development outputs"
+      tofu output -json > dev-outputs.json
+      buildkite-agent artifact upload "dev-outputs.json"
+    artifact_paths:
+      - "dev-outputs.json"
+    env:
+      VAULT_ADDR: "https://your-vault.example.com"
+      TF_WORKSPACE: "development"
+    plugins:
+      - hashicorp/vault#v1.3.0:
+          server: https://your-vault.example.com
+          auth:
+            method: jwt
+            role: buildkite-terraform
+    agents:
+      queue: "default"
+    if: build.env("deploy_confirmation") == "yes"
+
+  # ====================
+  # STAGING DEPLOYMENT
+  # ====================
+  
+  - block: ":test_tube: Deploy to Staging?"
+    prompt: "Deploy to staging environment?"
+    depends_on: "deploy-dev"
+    fields:
+      - select: "staging_confirmation"
+        key: "deploy_staging"
+        options:
+          - label: "Yes, deploy to staging"
+            value: "yes"
+          - label: "No, skip staging"
+            value: "no"
+        default: "no"
+        required: true
+
+  - label: ":test_tube: Deploy to Staging"
+    key: "deploy-staging"
+    depends_on: "deploy-dev"
+    command: |
+      echo "--- Authenticating to Vault"
+      export VAULT_ADDR="${VAULT_ADDR}"
+      vault auth -method=jwt role=buildkite-terraform jwt=$$BUILDKITE_OIDC_TOKEN
+      
+      echo "--- Retrieving MinIO credentials from Vault"
+      export AWS_ACCESS_KEY_ID=$$(vault kv get -field=access_key secret/minio/terraform)
+      export AWS_SECRET_ACCESS_KEY=$$(vault kv get -field=secret_key secret/minio/terraform)
+      
+      echo "--- Retrieving staging environment secrets"
+      export TF_VAR_db_password=$$(vault kv get -field=db_password secret/terraform/staging)
+      export TF_VAR_api_key=$$(vault kv get -field=api_key secret/terraform/staging)
+      # Add other staging-specific secrets as needed
+      
+      echo "--- Initializing OpenTofu for staging"
+      tofu init
+      
+      echo "--- Planning OpenTofu for staging"
+      tofu plan -out=staging-tfplan
+      
+      echo "--- Applying OpenTofu plan to staging"
+      tofu apply -auto-approve staging-tfplan
+      
+      echo "--- Generating staging outputs"
+      tofu output -json > staging-outputs.json
+      buildkite-agent artifact upload "staging-outputs.json"
+    artifact_paths:
+      - "staging-outputs.json"
+      - "staging-tfplan"
+    env:
+      VAULT_ADDR: "https://your-vault.example.com"
+      TF_WORKSPACE: "staging"
+    plugins:
+      - hashicorp/vault#v1.3.0:
+          server: https://your-vault.example.com
+          auth:
+            method: jwt
+            role: buildkite-terraform
+    agents:
+      queue: "default"
+    if: build.env("deploy_staging") == "yes"
+
+  # ====================
+  # PRODUCTION DEPLOYMENT
+  # ====================
+  
+  - block: ":rocket: Deploy to Production?"
+    prompt: "Deploy to production environment? This requires additional approval."
+    depends_on: "deploy-staging"
+    fields:
+      - select: "production_confirmation"
+        key: "deploy_production"
+        options:
+          - label: "Yes, deploy to production"
+            value: "yes"
+          - label: "No, cancel production deployment"
+            value: "no"
+        default: "no"
+        required: true
+      - text: "deployment_reason"
+        key: "reason"
+        hint: "Please provide a reason for this production deployment"
+        required: true
+
+  - label: ":warning: Production Pre-deployment Check"
+    key: "prod-pre-check"
+    depends_on: "deploy-staging"
+    command: |
+      echo "--- Authenticating to Vault"
+      export VAULT_ADDR="${VAULT_ADDR}"
+      vault auth -method=jwt role=buildkite-terraform jwt=$$BUILDKITE_OIDC_TOKEN
+      
+      echo "--- Retrieving MinIO credentials from Vault"
+      export AWS_ACCESS_KEY_ID=$$(vault kv get -field=access_key secret/minio/terraform)
+      export AWS_SECRET_ACCESS_KEY=$$(vault kv get -field=secret_key secret/minio/terraform)
+      
+      echo "--- Retrieving production environment secrets"
+      export TF_VAR_db_password=$$(vault kv get -field=db_password secret/terraform/production)
+      export TF_VAR_api_key=$$(vault kv get -field=api_key secret/terraform/production)
+      
+      echo "--- Initializing OpenTofu for production"
+      tofu init
+      
+      echo "--- Running production plan (dry run)"
+      tofu plan -out=production-tfplan
+      
+      echo "--- Production plan review"
+      echo "Deployment reason: $${reason}"
+      
+      buildkite-agent artifact upload "production-tfplan"
+    artifact_paths:
+      - "production-tfplan"
+    env:
+      VAULT_ADDR: "https://your-vault.example.com"
+      TF_WORKSPACE: "production
