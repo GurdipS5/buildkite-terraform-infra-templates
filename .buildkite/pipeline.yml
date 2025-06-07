@@ -2,23 +2,6 @@
 # Smart Terraform Template Pipeline - Handles All Logic
 
 env:
-  # Core configuration from consumer
-  PROJECT_NAME: "${TEMPLATE_PROJECT_NAME}"
-  SERVICE_NAME: "${TEMPLATE_SERVICE_NAME}"
-  TEAM_NAME: "${TEMPLATE_TEAM_NAME}"
-  TARGET_ENVIRONMENTS: "${TEMPLATE_TARGET_ENVIRONMENTS}"
-  REQUIRE_APPROVAL: "${TEMPLATE_REQUIRE_APPROVAL}"
-  MIN_COMPLIANCE_SCORE: "${TEMPLATE_MIN_COMPLIANCE_SCORE}"
-  SECURITY_SCAN_LEVEL: "${TEMPLATE_SECURITY_SCAN_LEVEL}"
-  WEBHOOK_URL: "${TEMPLATE_WEBHOOK_URL}"
-  NOTIFICATION_LEVEL: "${TEMPLATE_NOTIFICATION_LEVEL}"
-  VAULT_NAMESPACE: "${TEMPLATE_VAULT_NAMESPACE}"
-  BACKUP_RETENTION_DAYS: "${TEMPLATE_BACKUP_RETENTION_DAYS}"
-  ENABLE_AUTO_DOCUMENTATION: "${TEMPLATE_ENABLE_AUTO_DOCUMENTATION}"
-  CONFTEST_POLICY_OCI_URL: "${TEMPLATE_CONFTEST_POLICY_OCI_URL}"
-  CONFTEST_POLICY_NAMESPACE: "${TEMPLATE_CONFTEST_POLICY_NAMESPACE}"
-  HARBOR_REGISTRY: "${TEMPLATE_HARBOR_REGISTRY}"
-  
   # System configuration
   VAULT_ADDR: "https://vault.company.com"
 
@@ -30,7 +13,7 @@ steps:
   - label: ":1234: Semantic Versioning"
     key: "semantic-versioning"
     command: |
-      Write-Host "--- Generating semantic version for $env:PROJECT_NAME"
+      Write-Host "--- Generating semantic version for {{inputs.project_name}}"
       
       # Determine if this is main branch or PR
       $isMainBranch = ($env:BUILDKITE_BRANCH -eq "main" -or $env:BUILDKITE_BRANCH -eq "master")
@@ -50,7 +33,7 @@ steps:
       }
       
       buildkite-agent artifact upload "version-info.json"
-      Write-Host "✅ Semantic versioning completed for $env:PROJECT_NAME"
+      Write-Host "✅ Semantic versioning completed for {{inputs.project_name}}"
     artifact_paths:
       - "version-info.json"
     agents:
@@ -60,7 +43,7 @@ steps:
   - label: ":memo: Validate Conventional Commits"
     key: "validate-commits"
     command: |
-      Write-Host "--- Validating conventional commit messages for $env:PROJECT_NAME"
+      Write-Host "--- Validating conventional commit messages for {{inputs.project_name}}"
       
       # Install Node.js dependencies from consumer repo
       if (Test-Path "package.json") {
@@ -101,7 +84,7 @@ steps:
   - label: ":hammer: Code Formatting Check"
     key: "format-check"
     command: |
-      Write-Host "--- Checking OpenTofu formatting for $env:PROJECT_NAME"
+      Write-Host "--- Checking OpenTofu formatting for {{inputs.project_name}}"
       tofu fmt -check -recursive
       
       Write-Host "--- Checking for trailing whitespace and other formatting issues"
@@ -121,7 +104,7 @@ steps:
         }
       }
       
-      Write-Host "✅ All formatting checks passed for $env:PROJECT_NAME"
+      Write-Host "✅ All formatting checks passed for {{inputs.project_name}}"
     agents:
       queue: "windows"
 
@@ -129,14 +112,23 @@ steps:
     key: "security-scan"
     depends_on: "format-check"
     command: |
-      Write-Host "--- Running $env:SECURITY_SCAN_LEVEL security scanning for $env:PROJECT_NAME"
+      Write-Host "--- Running {{inputs.security_scan_level}} security scanning for {{inputs.project_name}}"
       
       New-Item -ItemType Directory -Force -Path "security-reports"
+      
+      # Authenticate to Vault for Mondoo and other secrets
+      Write-Host "--- Authenticating to Vault"
+      export VAULT_TOKEN=$(vault write -field=token auth/jwt/login \
+        role=buildkite-role \
+        jwt="$env:BUILDKITE_JWT_TOKEN")
+      
+      # Get Mondoo token from Vault
+      Write-Host "--- Retrieving Mondoo credentials from Vault"
+      $env:MONDOO_API_TOKEN = vault kv get -field=token {{inputs.vault_namespace}}/secret/data/mondoo
       
       # GitGuardian secret scanning
       if ($env:ENABLE_SECRET_SCANNING -eq "true") {
         Write-Host "--- Running GitGuardian secret scanning"
-        vault auth -method=jwt role=buildkite-terraform jwt=$env:BUILDKITE_OIDC_TOKEN
         $env:GITGUARDIAN_API_KEY = vault kv get -field=api_key secret/gitguardian/api
         
         # Use GitGuardian config from consumer repo
@@ -156,18 +148,22 @@ steps:
         }
       }
       
+      # Run Mondoo security scanning
+      Write-Host "--- Running Mondoo security scanning"
+      mondoo scan . --format json --output security-reports/mondoo-results.json
+      
       # Basic security scanning (always run)
       Write-Host "--- Running TFSec"
       Invoke-WebRequest -Uri "https://github.com/aquasecurity/tfsec/releases/latest/download/tfsec-windows-amd64.exe" -OutFile "tfsec.exe"
       .\tfsec.exe --format json --out security-reports/tfsec-results.json .
       
-      if ($env:SECURITY_SCAN_LEVEL -eq "standard" -or $env:SECURITY_SCAN_LEVEL -eq "comprehensive") {
+      if ("{{inputs.security_scan_level}}" -eq "standard" -or "{{inputs.security_scan_level}}" -eq "comprehensive") {
         Write-Host "--- Running Checkov"
         pip install checkov
         checkov -d . --framework terraform --output json --output-file security-reports/checkov-results.json
       }
       
-      if ($env:SECURITY_SCAN_LEVEL -eq "comprehensive") {
+      if ("{{inputs.security_scan_level}}" -eq "comprehensive") {
         Write-Host "--- Running Terrascan"
         Invoke-WebRequest -Uri "https://github.com/tenable/terrascan/releases/latest/download/terrascan_Windows_x86_64.tar.gz" -OutFile "terrascan.tar.gz"
         tar -xzf terrascan.tar.gz
@@ -189,18 +185,19 @@ steps:
         exit 1
       }
       
+      # Check compliance score against minimum requirement
+      if ($securitySummary.compliance_score -lt {{inputs.min_compliance_score}}) {
+        Write-Host "❌ Compliance score $($securitySummary.compliance_score) below minimum requirement of {{inputs.min_compliance_score}}"
+        exit 1
+      }
+      
       buildkite-agent artifact upload "security-reports\**\*"
-      Write-Host "✅ Security scanning completed for $env:PROJECT_NAME"
+      Write-Host "✅ Security scanning completed for {{inputs.project_name}}"
     artifact_paths:
       - "security-reports\\**\\*"
     env:
       VAULT_ADDR: "https://vault.company.com"
-    plugins:
-      - hashicorp/vault#v1.3.0:
-          server: https://vault.company.com
-          auth:
-            method: jwt
-            role: buildkite-terraform
+      VAULT_NAMESPACE: "{{inputs.vault_namespace}}"
     agents:
       queue: "windows"
 
@@ -208,17 +205,22 @@ steps:
     key: "tofu-validate"
     depends_on: "format-check"
     command: |
-      Write-Host "--- Authenticating to Vault for $env:PROJECT_NAME"
-      vault auth -method=jwt role=buildkite-terraform jwt=$env:BUILDKITE_OIDC_TOKEN
+      Write-Host "--- Authenticating to Vault for {{inputs.project_name}}"
+      export VAULT_TOKEN=$(vault write -field=token auth/jwt/login \
+        role=buildkite-role \
+        jwt="$env:BUILDKITE_JWT_TOKEN")
       
       Write-Host "--- Retrieving MinIO credentials"
       $env:AWS_ACCESS_KEY_ID = vault kv get -field=access_key secret/minio/terraform
       $env:AWS_SECRET_ACCESS_KEY = vault kv get -field=secret_key secret/minio/terraform
       
+      Write-Host "--- Retrieving Mondoo credentials"
+      $env:TF_VAR_mondoo_service_account_token = vault kv get -field=token {{inputs.vault_namespace}}/secret/data/mondoo
+      
       Write-Host "--- Setting project context variables"
-      $env:TF_VAR_project_name = $env:PROJECT_NAME
-      $env:TF_VAR_service_name = $env:SERVICE_NAME
-      $env:TF_VAR_team_name = $env:TEAM_NAME
+      $env:TF_VAR_project_name = "{{inputs.project_name}}"
+      $env:TF_VAR_service_name = "{{inputs.service_name}}"
+      $env:TF_VAR_team_name = "{{inputs.team_name}}"
       
       Write-Host "--- Initializing OpenTofu"
       tofu init
@@ -240,12 +242,7 @@ steps:
       - "tfplan.json"
     env:
       VAULT_ADDR: "https://vault.company.com"
-    plugins:
-      - hashicorp/vault#v1.3.0:
-          server: https://vault.company.com
-          auth:
-            method: jwt
-            role: buildkite-terraform
+      VAULT_NAMESPACE: "{{inputs.vault_namespace}}"
     agents:
       queue: "windows"
 
@@ -257,27 +254,29 @@ steps:
       Invoke-WebRequest -Uri "https://github.com/open-policy-agent/conftest/releases/latest/download/conftest_Windows_x86_64.zip" -OutFile "conftest.zip"
       Expand-Archive -Path "conftest.zip" -DestinationPath "."
       
-      Write-Host "--- Authenticating to Harbor registry"
-      vault auth -method=jwt role=buildkite-terraform jwt=$env:BUILDKITE_OIDC_TOKEN
+      Write-Host "--- Authenticating to Vault"
+      export VAULT_TOKEN=$(vault write -field=token auth/jwt/login \
+        role=buildkite-role \
+        jwt="$env:BUILDKITE_JWT_TOKEN")
       
       # Get Harbor credentials
       $harborUsername = vault kv get -field=username secret/harbor/terraform
       $harborPassword = vault kv get -field=password secret/harbor/terraform
       
       Write-Host "--- Logging into Harbor registry"
-      echo $harborPassword | docker login $env:HARBOR_REGISTRY --username $harborUsername --password-stdin
+      echo $harborPassword | docker login {{inputs.harbor_registry}} --username $harborUsername --password-stdin
       
       Write-Host "--- Pulling Conftest policies from OCI package"
-      Write-Host "Policy URL: $env:CONFTEST_POLICY_OCI_URL"
+      Write-Host "Policy URL: {{inputs.conftest_policy_oci_url}}"
       
       # Pull the OCI package containing policies
-      .\conftest.exe pull $env:CONFTEST_POLICY_OCI_URL
+      .\conftest.exe pull {{inputs.conftest_policy_oci_url}}
       
       Write-Host "--- Downloading Terraform plan"
       buildkite-agent artifact download "tfplan.json" .
       
       # Parse namespaces
-      $namespaces = $env:CONFTEST_POLICY_NAMESPACE -split "," | ForEach-Object { $_.Trim() }
+      $namespaces = "{{inputs.conftest_policy_namespace}}" -split "," | ForEach-Object { $_.Trim() }
       
       Write-Host "--- Running policy validation against namespaces: $($namespaces -join ', ')"
       
@@ -351,8 +350,8 @@ steps:
       
       # Generate comprehensive policy report
       $policyReport = @{
-        project = $env:PROJECT_NAME
-        oci_package = $env:CONFTEST_POLICY_OCI_URL
+        project = "{{inputs.project_name}}"
+        oci_package = "{{inputs.conftest_policy_oci_url}}"
         namespaces_tested = $namespaces
         overall_result = if ($overallResult) { "passed" } else { "failed" }
         test_timestamp = Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ"
@@ -377,10 +376,10 @@ steps:
           $violationCount = ($allResults | Where-Object { $_.violations }).Count
           $notificationFields = @{
             "Violations" = $violationCount
-            "OCI Package" = $env:CONFTEST_POLICY_OCI_URL
+            "OCI Package" = "{{inputs.conftest_policy_oci_url}}"
           }
           
-          .\scripts\send-notification.ps1 -Channel "webhook" -WebhookUrl $env:WEBHOOK_URL -Message "Policy violations detected in $env:PROJECT_NAME" -Title "🚨 Policy Violations" -Fields $notificationFields
+          .\scripts\send-notification.ps1 -Channel "webhook" -WebhookUrl "{{inputs.webhook_url}}" -Message "Policy violations detected in {{inputs.project_name}}" -Title "🚨 Policy Violations" -Fields $notificationFields
         } catch {
           Write-Host "⚠️ Could not send notification: $($_.Exception.Message)"
         }
@@ -397,12 +396,7 @@ steps:
       - "policy-report.html"
     env:
       VAULT_ADDR: "https://vault.company.com"
-    plugins:
-      - hashicorp/vault#v1.3.0:
-          server: https://vault.company.com
-          auth:
-            method: jwt
-            role: buildkite-terraform
+      VAULT_NAMESPACE: "{{inputs.vault_namespace}}"
     agents:
       queue: "windows"
 
@@ -410,7 +404,7 @@ steps:
     key: "auto-docs"
     depends_on: "format-check"
     command: |
-      Write-Host "--- Generating documentation for $env:PROJECT_NAME"
+      Write-Host "--- Generating documentation for {{inputs.project_name}}"
       Invoke-WebRequest -Uri "https://github.com/terraform-docs/terraform-docs/releases/latest/download/terraform-docs-v0.16.0-windows-amd64.zip" -OutFile "terraform-docs.zip"
       Expand-Archive -Path "terraform-docs.zip" -DestinationPath "."
       
@@ -429,13 +423,241 @@ steps:
       - "*-README.md"
     agents:
       queue: "windows"
-    if: build.env("ENABLE_AUTO_DOCUMENTATION") == "true"
+    if: "{{inputs.enable_auto_documentation}}" == "true"
+
+
+
+  # Wait for validation phase to complete
+  - wait: ~
+    continue_on_failure: false
+
+  # ====================
+  # DYNAMIC ENVIRONMENT DEPLOYMENT
+  # ====================
+
+  # Generate deployment steps dynamically based on TARGET_ENVIRONMENTS
+  - label: ":gear: Generate Environment Deployments"
+    key: "generate-deployments"
+    command: |
+      Write-Host "--- Generating deployment steps for environments: {{inputs.target_environments}}"
+      
+      $environments = "{{inputs.target_environments}}" -split ","
+      $deploymentSteps = @()
+      
+      foreach ($environment in $environments) {
+        $env_clean = $environment.Trim()
+        $env_name = switch ($env_clean) {
+          "dev" { "Development" }
+          "tst" { "Test" }
+          "stg" { "Staging" }
+          "prd" { "Production" }
+          default { $env_clean.ToUpper() }
+        }
+        
+        # Create approval step if required
+        if ("{{inputs.require_approval}}" -eq "true" -or $env_clean -eq "prd") {
+          $approvalStep = @{
+            block = "Deploy to $env_name?"
+            key = "approve-$env_clean"
+            prompt = "Deploy {{inputs.project_name}} to $env_name environment?"
+            fields = @(
+              @{
+                select = "confirmation"
+                key = "deploy_$env_clean"
+                options = @(
+                  @{label = "Yes, deploy to $env_name"; value = "yes"}
+                  @{label = "No, skip $env_name"; value = "no"}
+                )
+                default = "no"
+                required = $true
+              }
+            )
+          }
+          
+          if ($env_clean -eq "prd") {
+            $approvalStep.fields += @{
+              text = "deployment_reason"
+              key = "reason_$env_clean"
+              hint = "Please provide a reason for this $env_name deployment"
+              required = $true
+            }
+          }
+          
+          $deploymentSteps += $approvalStep
+        }
+        
+        # Create deployment step
+        $deploymentStep = @{
+          label = "🚀 Deploy to $env_name"
+          key = "deploy-$env_clean"
+          command = @"
+Write-Host "--- Deploying {{inputs.project_name}} to $env_name Environment"
+
+Write-Host "--- Authenticating to Vault"
+export VAULT_TOKEN=`$(vault write -field=token auth/jwt/login \
+  role=buildkite-role \
+  jwt="`$env:BUILDKITE_JWT_TOKEN")
+
+Write-Host "--- Retrieving MinIO credentials"
+`$env:AWS_ACCESS_KEY_ID = vault kv get -field=access_key secret/minio/terraform
+`$env:AWS_SECRET_ACCESS_KEY = vault kv get -field=secret_key secret/minio/terraform
+
+Write-Host "--- Retrieving Mondoo credentials"
+`$env:TF_VAR_mondoo_service_account_token = vault kv get -field=token {{inputs.vault_namespace}}/secret/data/mondoo
+
+Write-Host "--- Retrieving $env_clean environment secrets"
+`$env:TF_VAR_db_password = vault kv get -field=db_password secret/{{inputs.vault_namespace}}/$env_clean
+`$env:TF_VAR_api_key = vault kv get -field=api_key secret/{{inputs.vault_namespace}}/$env_clean
+`$env:TF_VAR_project_name = "{{inputs.project_name}}"
+`$env:TF_VAR_service_name = "{{inputs.service_name}}"
+`$env:TF_VAR_team_name = "{{inputs.team_name}}"
+`$env:TF_VAR_environment = "$env_clean"
+
+Write-Host "--- Downloading plan file"
+buildkite-agent artifact download "tfplan" .
+
+Write-Host "--- Initializing OpenTofu for $env_clean"
+tofu init
+
+Write-Host "--- Executing deployment"
+tofu apply -auto-approve tfplan
+
+Write-Host "--- Post-deployment validation"
+`$appUrl = tofu output -raw application_url -ErrorAction SilentlyContinue
+if (`$appUrl) {
+  Write-Host "--- Running smoke tests"
+  .\scripts\smoke-tests.ps1 -BaseUrl `$appUrl
+}
+
+Write-Host "--- Generating outputs"
+tofu output -json | Out-File -FilePath "$env_clean-outputs.json" -Encoding utf8
+
+buildkite-agent artifact upload "$env_clean-outputs.json"
+
+Write-Host "✅ Deployment to $env_name completed successfully"
+"@
+          artifact_paths = @("$env_clean-outputs.json")
+          env = @{
+            VAULT_ADDR = "https://vault.company.com"
+            VAULT_NAMESPACE = "{{inputs.vault_namespace}}"
+            TF_WORKSPACE = $env_clean
+          }
+          agents = @{queue = "windows"}
+        }
+        
+        # Add conditional execution for approval-required environments
+        if ("{{inputs.require_approval}}" -eq "true" -or $env_clean -eq "prd") {
+          $deploymentStep["if"] = "build.env(`"deploy_$env_clean`") == `"yes`""
+        }
+        
+        $deploymentSteps += $deploymentStep
+      }
+      
+      # Convert to YAML and upload as new pipeline steps
+      $pipelineYaml = @{steps = $deploymentSteps} | ConvertTo-Yaml
+      $pipelineYaml | Out-File "deployment-pipeline.yml" -Encoding utf8
+      
+      buildkite-agent pipeline upload deployment-pipeline.yml
+      
+      Write-Host "✅ Generated deployment steps for: $($environments -join ', ')"
+    agents:
+      queue: "windows"
+
+  # ====================
+  # POST-DEPLOYMENT CLEANUP
+  # ====================
+  
+  - label: ":broom: Intelligent Cleanup"
+    key: "cleanup"
+    command: |
+      Write-Host "--- Running intelligent cleanup for {{inputs.project_name}}"
+      
+      # Generate cleanup report and perform cleanup
+      .\scripts\generate-cleanup-report.ps1 -OutputPath "cleanup-report.json" -ProjectName "{{inputs.project_name}}" -RetentionDays "{{inputs.backup_retention_days}}"
+      
+      buildkite-agent artifact upload "cleanup-report.json"
+      Write-Host "✅ Cleanup completed for {{inputs.project_name}}"
+    artifact_paths:
+      - "cleanup-report.json"
+    agents:
+      queue: "windows"
+
+  # ====================
+  # VERSIONING & RELEASE PHASE
+  # ====================
+
+  - label: ":1234: Semantic Versioning"
+    key: "semantic-versioning"
+    command: |
+      Write-Host "--- Generating semantic version for {{inputs.project_name}}"
+      
+      # Determine if this is main branch or PR
+      $isMainBranch = ($env:BUILDKITE_BRANCH -eq "main" -or $env:BUILDKITE_BRANCH -eq "master")
+      $isPullRequest = ($env:BUILDKITE_PULL_REQUEST -and $env:BUILDKITE_PULL_REQUEST -ne "false")
+      
+      Write-Host "Branch: $env:BUILDKITE_BRANCH"
+      Write-Host "Is main branch: $isMainBranch"
+      Write-Host "Is pull request: $isPullRequest"
+      
+      # Generate version
+      if ($isMainBranch) {
+        .\scripts\generate-version.ps1 -OutputPath "version-info.json" -IsMainBranch
+      } elseif ($isPullRequest) {
+        .\scripts\generate-version.ps1 -OutputPath "version-info.json" -IsPullRequest
+      } else {
+        .\scripts\generate-version.ps1 -OutputPath "version-info.json"
+      }
+      
+      buildkite-agent artifact upload "version-info.json"
+      Write-Host "✅ Semantic versioning completed for {{inputs.project_name}}"
+    artifact_paths:
+      - "version-info.json"
+    agents:
+      queue: "windows"
+    if: build.env("ENABLE_SEMANTIC_VERSIONING") == "true"
+
+  - label: ":memo: Validate Conventional Commits"
+    key: "validate-commits"
+    command: |
+      Write-Host "--- Validating conventional commit messages for {{inputs.project_name}}"
+      
+      # Install Node.js dependencies from consumer repo
+      if (Test-Path "package.json") {
+        Write-Host "Installing NPM dependencies from consumer repo..."
+        npm install
+      } else {
+        Write-Host "No package.json found, installing commitlint manually..."
+        npm install --no-save @commitlint/cli @commitlint/config-conventional
+      }
+      
+      # Use commitlint config from consumer repo
+      $commitlintConfig = if (Test-Path "commitlint.config.js") { 
+        "commitlint.config.js" 
+      } else { 
+        Write-Warning "commitlint.config.js not found in consumer repo, using default config"
+        "@commitlint/config-conventional"
+      }
+      
+      Write-Host "Using commitlint config: $commitlintConfig"
+      
+      # Validate commit messages
+      if (Test-Path "commitlint.config.js") {
+        .\scripts\validate-conventional-commits.ps1 -ConfigPath $commitlintConfig
+      } else {
+        # Use default validation if no config file
+        npx commitlint --from=HEAD~1 --to=HEAD --config '@commitlint/config-conventional'
+      }
+      
+      Write-Host "✅ Conventional commit validation completed"
+    agents:
+      queue: "windows"
+    if: build.env("VALIDATE_CONVENTIONAL_COMMITS") == "true"
 
   - label: ":scroll: Generate Changelog"
     key: "generate-changelog"
     depends_on: ["semantic-versioning"]
     command: |
-      Write-Host "--- Generating changelog for $env:PROJECT_NAME"
+      Write-Host "--- Generating changelog for {{inputs.project_name}}"
       
       # Install Node.js dependencies from consumer repo
       if (Test-Path "package.json") {
@@ -468,7 +690,7 @@ steps:
       buildkite-agent artifact upload "CHANGELOG.md"
       buildkite-agent artifact upload "changelog-metadata.json"
       
-      Write-Host "✅ Changelog generation completed for $env:PROJECT_NAME"
+      Write-Host "✅ Changelog generation completed for {{inputs.project_name}}"
     artifact_paths:
       - "CHANGELOG.md"
       - "changelog-metadata.json"
@@ -476,223 +698,20 @@ steps:
       queue: "windows"
     if: build.env("ENABLE_CHANGELOG_GENERATION") == "true"
 
-  # Wait for validation phase to complete
-  - wait: ~
-    continue_on_failure: false
-
-  # ====================
-  # DYNAMIC ENVIRONMENT DEPLOYMENT
-  # ====================
-
-  # Generate deployment steps dynamically based on TARGET_ENVIRONMENTS
-  - label: ":gear: Generate Environment Deployments"
-    key: "generate-deployments"
-    command: |
-      Write-Host "--- Generating deployment steps for environments: $env:TARGET_ENVIRONMENTS"
-      
-      $environments = $env:TARGET_ENVIRONMENTS -split ","
-      $deploymentSteps = @()
-      
-      foreach ($environment in $environments) {
-        $env_clean = $environment.Trim()
-        $env_name = switch ($env_clean) {
-          "dev" { "Development" }
-          "tst" { "Test" }
-          "stg" { "Staging" }
-          "prd" { "Production" }
-          default { $env_clean.ToUpper() }
-        }
-        
-        # Create approval step if required
-        if ($env:REQUIRE_APPROVAL -eq "true" -or $env_clean -eq "prd") {
-          $approvalStep = @{
-            block = "Deploy to $env_name?"
-            key = "approve-$env_clean"
-            prompt = "Deploy $env:PROJECT_NAME to $env_name environment?"
-            fields = @(
-              @{
-                select = "confirmation"
-                key = "deploy_$env_clean"
-                options = @(
-                  @{label = "Yes, deploy to $env_name"; value = "yes"}
-                  @{label = "No, skip $env_name"; value = "no"}
-                )
-                default = "no"
-                required = $true
-              }
-            )
-          }
-          
-          if ($env_clean -eq "prd") {
-            $approvalStep.fields += @{
-              text = "deployment_reason"
-              key = "reason_$env_clean"
-              hint = "Please provide a reason for this $env_name deployment"
-              required = $true
-            }
-          }
-          
-          $deploymentSteps += $approvalStep
-        }
-        
-        # Create deployment step
-        $deploymentStep = @{
-          label = "🚀 Deploy to $env_name"
-          key = "deploy-$env_clean"
-          command = @"
-Write-Host "--- Deploying $env:PROJECT_NAME to $env_name Environment"
-
-Write-Host "--- Authenticating to Vault"
-vault auth -method=jwt role=buildkite-terraform jwt=`$env:BUILDKITE_OIDC_TOKEN
-
-Write-Host "--- Retrieving MinIO credentials"
-`$env:AWS_ACCESS_KEY_ID = vault kv get -field=access_key secret/minio/terraform
-`$env:AWS_SECRET_ACCESS_KEY = vault kv get -field=secret_key secret/minio/terraform
-
-Write-Host "--- Retrieving $env_clean environment secrets"
-`$env:TF_VAR_db_password = vault kv get -field=db_password secret/$env:VAULT_NAMESPACE/$env_clean
-`$env:TF_VAR_api_key = vault kv get -field=api_key secret/$env:VAULT_NAMESPACE/$env_clean
-`$env:TF_VAR_project_name = "$env:PROJECT_NAME"
-`$env:TF_VAR_service_name = "$env:SERVICE_NAME"
-`$env:TF_VAR_team_name = "$env:TEAM_NAME"
-`$env:TF_VAR_environment = "$env_clean"
-
-Write-Host "--- Downloading plan file"
-buildkite-agent artifact download "tfplan" .
-
-Write-Host "--- Initializing OpenTofu for $env_clean"
-tofu init
-
-Write-Host "--- Executing deployment"
-tofu apply -auto-approve tfplan
-
-Write-Host "--- Post-deployment validation"
-`$appUrl = tofu output -raw application_url -ErrorAction SilentlyContinue
-if (`$appUrl) {
-  Write-Host "--- Running smoke tests"
-  .\scripts\smoke-tests.ps1 -BaseUrl `$appUrl
-}
-
-Write-Host "--- Generating outputs"
-tofu output -json | Out-File -FilePath "$env_clean-outputs.json" -Encoding utf8
-
-buildkite-agent artifact upload "$env_clean-outputs.json"
-
-Write-Host "✅ Deployment to $env_name completed successfully"
-"@
-          artifact_paths = @("$env_clean-outputs.json")
-          env = @{
-            VAULT_ADDR = "https://vault.company.com"
-            TF_WORKSPACE = $env_clean
-          }
-          plugins = @(
-            @{
-              "hashicorp/vault#v1.3.0" = @{
-                server = "https://vault.company.com"
-                auth = @{
-                  method = "jwt"
-                  role = "buildkite-terraform"
-                }
-              }
-            }
-          )
-          agents = @{queue = "windows"}
-        }
-        
-        # Add conditional execution for approval-required environments
-        if ($env:REQUIRE_APPROVAL -eq "true" -or $env_clean -eq "prd") {
-          $deploymentStep["if"] = "build.env(`"deploy_$env_clean`") == `"yes`""
-        }
-        
-        $deploymentSteps += $deploymentStep
-      }
-      
-      # Convert to YAML and upload as new pipeline steps
-      $pipelineYaml = @{steps = $deploymentSteps} | ConvertTo-Yaml
-      $pipelineYaml | Out-File "deployment-pipeline.yml" -Encoding utf8
-      
-      buildkite-agent pipeline upload deployment-pipeline.yml
-      
-      Write-Host "✅ Generated deployment steps for: $($environments -join ', ')"
-    agents:
-      queue: "windows"
-
-  # ====================
-  # POST-DEPLOYMENT MONITORING
-  # ====================
-  
-  - label: ":bar_chart: Setup Monitoring & Alerts"
-    key: "setup-monitoring"
-    command: |
-      Write-Host "--- Setting up monitoring for $env:PROJECT_NAME"
-      
-      if ($env:MONITORING_ENABLED -eq "true") {
-        vault auth -method=jwt role=buildkite-terraform jwt=$env:BUILDKITE_OIDC_TOKEN
-        
-        # Setup monitoring dashboards
-        $monitoringConfig = @{
-          project = $env:PROJECT_NAME
-          service = $env:SERVICE_NAME
-          team = $env:TEAM_NAME
-          environments = $env:TARGET_ENVIRONMENTS -split ","
-          compliance_threshold = $env:MIN_COMPLIANCE_SCORE
-          error_rate_threshold = $env:MAX_ERROR_RATE
-          notification_channel = $env:SLACK_CHANNEL
-        }
-        
-        $monitoringConfig | ConvertTo-Json | Out-File "monitoring-config.json"
-        
-        # Send to monitoring system
-        $webhookUrl = vault kv get -field=webhook_url secret/monitoring/setup
-        Invoke-RestMethod -Uri $webhookUrl -Method Post -Body ($monitoringConfig | ConvertTo-Json) -ContentType "application/json"
-        
-        buildkite-agent artifact upload "monitoring-config.json"
-      }
-      
-      Write-Host "✅ Monitoring setup completed"
-    artifact_paths:
-      - "monitoring-config.json"
-    env:
-      VAULT_ADDR: "https://vault.company.com"
-    plugins:
-      - hashicorp/vault#v1.3.0:
-          server: https://vault.company.com
-          auth:
-            method: jwt
-            role: buildkite-terraform
-    agents:
-      queue: "windows"
-    if: build.env("MONITORING_ENABLED") == "true"
-
-  - label: ":broom: Intelligent Cleanup"
-    key: "cleanup"
-    command: |
-      Write-Host "--- Running intelligent cleanup for $env:PROJECT_NAME"
-      
-      # Generate cleanup report and perform cleanup
-      .\scripts\generate-cleanup-report.ps1 -OutputPath "cleanup-report.json" -ProjectName $env:PROJECT_NAME -RetentionDays $env:BACKUP_RETENTION_DAYS
-      
-      buildkite-agent artifact upload "cleanup-report.json"
-      Write-Host "✅ Cleanup completed for $env:PROJECT_NAME"
-    artifact_paths:
-      - "cleanup-report.json"
-    agents:
-      queue: "windows"
-
 # ====================
 # NOTIFICATIONS
 # ====================
 
 notify:
-  - webhook: "${WEBHOOK_URL}"
+  - webhook: "{{inputs.webhook_url}}"
     if: build.state == "failed"
     message: |
       {
         "alert_type": "pipeline_failure",
-        "project": "${PROJECT_NAME}",
-        "service": "${SERVICE_NAME}",
-        "team": "${TEAM_NAME}",
-        "environments": "${TARGET_ENVIRONMENTS}",
+        "project": "{{inputs.project_name}}",
+        "service": "{{inputs.service_name}}",
+        "team": "{{inputs.team_name}}",
+        "environments": "{{inputs.target_environments}}",
         "build_url": "${BUILDKITE_BUILD_URL}",
         "commit": "${BUILDKITE_COMMIT}",
         "branch": "${BUILDKITE_BRANCH}",
@@ -701,15 +720,15 @@ notify:
         "message": "Terraform pipeline failed"
       }
 
-  - webhook: "${WEBHOOK_URL}"
+  - webhook: "{{inputs.webhook_url}}"
     if: build.state == "passed"
     message: |
       {
         "alert_type": "pipeline_success",
-        "project": "${PROJECT_NAME}",
-        "service": "${SERVICE_NAME}",
-        "team": "${TEAM_NAME}",
-        "environments": "${TARGET_ENVIRONMENTS}",
+        "project": "{{inputs.project_name}}",
+        "service": "{{inputs.service_name}}",
+        "team": "{{inputs.team_name}}",
+        "environments": "{{inputs.target_environments}}",
         "build_url": "${BUILDKITE_BUILD_URL}",
         "commit": "${BUILDKITE_COMMIT}",
         "branch": "${BUILDKITE_BRANCH}",
