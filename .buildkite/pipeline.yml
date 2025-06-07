@@ -423,7 +423,7 @@ steps:
       - "*-README.md"
     agents:
       queue: "windows"
-    if: '{{inputs.enable_auto_documentation}} == "true"'
+    if: "'{{inputs.enable_auto_documentation}} == true'"
 
 
 
